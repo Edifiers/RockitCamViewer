@@ -108,7 +108,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         new Thread(this::heartbeatLoop, "Heartbeat").start();
 
         uiHandler.postDelayed(this::updateStats, 1000);
-        updateStatus("已启动，等待数据...");
+        updateStatus("[V3] 已启动，等待数据...");
     }
 
     @Override
@@ -482,7 +482,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             float fps = decodedFrames / dt;
 
             String status = String.format(Locale.US,
-                "RockitCam UCP H.265 Viewer\n" +
+                "[V3] RockitCam UCP H.265\n" +
                 "码率: %.0f kbps | 帧率: %.1f fps\n" +
                 "收包: %d | SN丢失: %d | 丢帧: %d\n" +
                 "状态: %s",
