@@ -211,21 +211,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     //  线程2：从队列取包 → 拼接 → 解析 NALU → 喂 MediaCodec 输入
     // ============================================================
     private void naluParseLoop() {
+        java.util.ArrayList<PacketData> batch = new java.util.ArrayList<>(64);
+
         while (running) {
             try {
-                PacketData pd = recvQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
-                if (pd == null) continue;
+                // 阻塞等第一个包
+                PacketData first = recvQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+                if (first == null) continue;
 
-                // 追加到 NALU 缓冲
-                if (naluLen + pd.length < naluBuffer.length) {
-                    System.arraycopy(pd.data, 0, naluBuffer, naluLen, pd.length);
-                    naluLen += pd.length;
+                batch.clear();
+                batch.add(first);
+                // 非阻塞批量取出剩余的包
+                recvQueue.drainTo(batch, 64);
+
+                // 批量追加到 NALU 缓冲
+                for (PacketData pd : batch) {
+                    if (naluLen + pd.length < naluBuffer.length) {
+                        System.arraycopy(pd.data, 0, naluBuffer, naluLen, pd.length);
+                        naluLen += pd.length;
+                    }
+                    freePool.offer(pd.data);
                 }
 
-                // 归还 buffer 到池
-                freePool.offer(pd.data);
-
-                // 提取完整 NALU
+                // 一次性解析所有 NALU
                 processNaluBuffer();
 
             } catch (InterruptedException e) {
@@ -322,8 +330,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      */
     private void feedToDecoder(byte[] data, int offset, int length, boolean isIDR) {
         try {
-            int inIdx = decoder.dequeueInputBuffer(5000);  // 5ms 超时
-            if (inIdx < 0) return;  // 输入满了就跳过，不阻塞收包
+            int inIdx = decoder.dequeueInputBuffer(0);  // 非阻塞，拿不到就丢
+            if (inIdx < 0) return;
 
             ByteBuffer inBuf = decoder.getInputBuffer(inIdx);
             if (inBuf == null) return;
@@ -353,8 +361,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             try {
                 int outIdx = decoder.dequeueOutputBuffer(info, 10000);  // 10ms 等待
                 if (outIdx >= 0) {
-                    // 用时间戳渲染，利用 vsync 防撕裂
-                    decoder.releaseOutputBuffer(outIdx, info.presentationTimeUs * 1000);
+                    // 立即渲染，低延迟优先
+                    decoder.releaseOutputBuffer(outIdx, true);
                     decodedFrames++;
                 }
             } catch (Exception e) {
