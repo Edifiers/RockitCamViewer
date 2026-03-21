@@ -215,6 +215,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             // VPS/SPS/PPS 参数集
                             parseParamSets(frameBuf, frameLen);
                         } else if (frameLen > 0) {
+                            // IDR 帧通常带 VPS+SPS+PPS，若解码器未初始化则从中提取
+                            if (!codecConfigured && frameType == TYPE_IDR) {
+                                parseParamSets(frameBuf, frameLen);
+                            }
                             // 视频帧（IDR 或 P），整帧喂解码器
                             if (decoder != null && codecConfigured) {
                                 feedWholeFrame(frameBuf, frameLen);
