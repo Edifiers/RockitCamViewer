@@ -51,7 +51,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private volatile boolean running = false;
     private DatagramSocket recvSocket;
-    private DatagramSocket sendSocket;
     private MediaCodec decoder;
     private Surface surface;
     private TextView statusText;
@@ -114,7 +113,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         try { Thread.sleep(300); } catch (InterruptedException ignored) {}
         releaseDecoder();
         closeSocket(recvSocket);
-        closeSocket(sendSocket);
     }
 
     @Override
@@ -128,16 +126,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // ============================================================
-    //  心跳线程（独立 socket）
+    //  心跳线程（复用 recvSocket，确保与数据接收端口一致）
     // ============================================================
     private void heartbeatLoop() {
+        // 等待 recvSocket 初始化完成
+        while (running && recvSocket == null) {
+            try { Thread.sleep(50); } catch (InterruptedException e) { return; }
+        }
         try {
-            sendSocket = new DatagramSocket();
             InetAddress addr = InetAddress.getByName(SERVER_IP);
             while (running) {
                 try {
-                    byte[] data = "RKCAM:CONNECT".getBytes();
-                    sendSocket.send(new DatagramPacket(data, data.length, addr, SERVER_PORT));
+                    if (recvSocket != null && !recvSocket.isClosed()) {
+                        byte[] data = "RKCAM:CONNECT".getBytes();
+                        recvSocket.send(new DatagramPacket(data, data.length, addr, SERVER_PORT));
+                    }
                 } catch (Exception e) { /* ignore */ }
                 try { Thread.sleep(1000); } catch (InterruptedException e) { break; }
             }
@@ -146,10 +149,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void sendCommand(String cmd) {
         try {
-            if (sendSocket != null && !sendSocket.isClosed()) {
+            if (recvSocket != null && !recvSocket.isClosed()) {
                 byte[] data = cmd.getBytes();
                 InetAddress addr = InetAddress.getByName(SERVER_IP);
-                sendSocket.send(new DatagramPacket(data, data.length, addr, SERVER_PORT));
+                recvSocket.send(new DatagramPacket(data, data.length, addr, SERVER_PORT));
             }
         } catch (Exception e) { /* ignore */ }
     }
