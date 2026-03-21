@@ -195,17 +195,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     int dataOffset = HDR_SIZE;
                     int dataLen = len - HDR_SIZE;
 
-                    // 丢包检测：帧序号不连续 → 请求 IDR
-                    if (lastFrameSeq >= 0 && !moreData) {
-                        int expected = (lastFrameSeq + 1) & 0xFF;
-                        if (frameSeq != expected) {
-                            lostFrames++;
-                            sendCommand("RKCAM:IDR");
-                            // 丢弃当前不完整的帧
-                            frameLen = 0;
-                        }
-                    }
-
                     // 追加数据到帧缓冲
                     if (frameLen + dataLen < frameBuf.length) {
                         System.arraycopy(buf, dataOffset, frameBuf, frameLen, dataLen);
@@ -215,20 +204,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     // moredata=0 → 一帧结束，处理整帧
                     if (!moreData) {
                         if (frameType == TYPE_PARAM) {
-                            // VPS/SPS/PPS 参数集
+                            // VPS/SPS/PPS 参数集：解析但不参与丢包检测
                             parseParamSets(frameBuf, frameLen);
-                        } else if (frameLen > 0) {
-                            // IDR 帧通常带 VPS+SPS+PPS，若解码器未初始化则从中提取
-                            if (!codecConfigured && frameType == TYPE_IDR) {
-                                parseParamSets(frameBuf, frameLen);
+                        } else {
+                            // 视频帧（IDR 或 P）：丢包检测只对视频帧生效
+                            if (lastFrameSeq >= 0) {
+                                int expected = (lastFrameSeq + 1) & 0xFF;
+                                if (frameSeq != expected) {
+                                    lostFrames++;
+                                    sendCommand("RKCAM:IDR");
+                                    frameLen = 0;
+                                    lastFrameSeq = frameSeq;
+                                    continue;  // 丢弃不完整帧，跳到下一包
+                                }
                             }
-                            // 视频帧（IDR 或 P），整帧喂解码器
-                            if (decoder != null && codecConfigured) {
-                                feedWholeFrame(frameBuf, frameLen);
+                            lastFrameSeq = frameSeq;
+
+                            if (frameLen > 0) {
+                                // IDR 帧通常带 VPS+SPS+PPS，若解码器未初始化则从中提取
+                                if (!codecConfigured && frameType == TYPE_IDR) {
+                                    parseParamSets(frameBuf, frameLen);
+                                }
+                                // 整帧喂解码器
+                                if (decoder != null && codecConfigured) {
+                                    feedWholeFrame(frameBuf, frameLen);
+                                }
                             }
                         }
 
-                        lastFrameSeq = frameSeq;
                         frameLen = 0;
                     }
 
