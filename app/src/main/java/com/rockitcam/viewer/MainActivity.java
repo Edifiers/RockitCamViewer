@@ -19,14 +19,17 @@ import java.nio.ByteBuffer;
 import java.util.Locale;
 
 /**
- * RockitCam H.265 UDP 图传接收端
+ * RockitCam UCP H.265 图传接收端
  *
- * 协议：每个 UDP 包前 2 字节包头
- *   [0] flags:  bit7=moredata, bit6~4=帧类型(0=P,1=IDR,2=VPS/SPS/PPS)
- *   [1] frame_seq: 帧序号 0-255
- *   [2...] H.265 裸数据
+ * UCP 协议：每个 UDP 包前 12 字节包头
+ *   [0]     ver_magic = 0x15
+ *   [1]     flags: [confirm:1|moredata:1|session:2|hb:1|reserved:3]
+ *   [2-3]   una (uint16, 网络序)
+ *   [4-5]   sn  (uint16, 网络序) — 每个分片独立递增
+ *   [6-7]   len (uint16, 网络序)
+ *   [8-11]  timestamp (uint32, 网络序)
  *
- * 接收端通过 moredata=0 精确判断帧边界，整帧喂解码器
+ * 通过 SN 间隙精确检测丢包，丢包后等完整无损 IDR 恢复
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -34,20 +37,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final int SERVER_PORT = 8080;
     private static final int LOCAL_PORT = 9000;
 
-    // 包头常量（与发送端一致）
-    private static final int HDR_SIZE = 2;
-    private static final int FLAG_MORE = 0x80;
-    private static final int TYPE_MASK = 0x70;
-    private static final int TYPE_P    = 0x00;
-    private static final int TYPE_IDR  = 0x10;
-    private static final int TYPE_PARAM = 0x20;
+    // UCP 协议常量
+    private static final int UCP_HDR_SIZE      = 12;
+    private static final int UCP_VER_MAGIC     = 0x15;
+    private static final int UCP_FLAG_MOREDATA = 0x40;
+    private static final int UCP_SESSION_CTRL  = 0x10;
+    private static final int UCP_FLAG_HB       = 0x08;
+    private static final int BLOCK_ACK_MAGIC   = 0x5A;
 
     // H.265 NALU 类型
     private static final int NAL_VPS = 32;
     private static final int NAL_SPS = 33;
     private static final int NAL_PPS = 34;
-    private static final int NAL_IDR_W_RADL = 19;
-    private static final int NAL_IDR_N_LP = 20;
 
     private volatile boolean running = false;
     private DatagramSocket recvSocket;
@@ -62,12 +63,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile int recvPkts = 0;
     private volatile int decodedFrames = 0;
     private volatile int lostFrames = 0;
+    private volatile int lostSnCount = 0;
     private long lastStatTime = 0;
 
-    // 帧组装缓冲（按帧边界整帧拼接后再喂解码器）
+    // 帧组装
     private byte[] frameBuf = new byte[1024 * 1024];
     private int frameLen = 0;
-    private int lastFrameSeq = -1;  // 上一帧序号，用于丢包检测
+
+    // SN 丢包检测
+    private int videoRcvNxt = 0;
+    private boolean firstPacket = true;
+    private boolean frameHasLoss = false;
 
     // 参数集缓存
     private volatile boolean codecConfigured = false;
@@ -76,6 +82,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private byte[] ppsData;
 
     private int decodeErrorCount = 0;
+    private volatile boolean registered = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -128,16 +135,64 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // ============================================================
+    //  UCP 包头解析
+    // ============================================================
+    private boolean isValidUcp(byte[] buf, int len) {
+        return len >= UCP_HDR_SIZE && (buf[0] & 0xFF) == UCP_VER_MAGIC;
+    }
+
+    private int parseSn(byte[] buf) {
+        return ((buf[4] & 0xFF) << 8) | (buf[5] & 0xFF);
+    }
+
+    private boolean parseMoreData(byte[] buf) {
+        return (buf[1] & UCP_FLAG_MOREDATA) != 0;
+    }
+
+    // ============================================================
+    //  构建 UCP 心跳包（12字节头 + 11字节 Block ACK）
+    // ============================================================
+    private byte[] buildUcpHeartbeat(int una) {
+        byte[] pkt = new byte[UCP_HDR_SIZE + 11];
+        pkt[0] = (byte) UCP_VER_MAGIC;
+        pkt[1] = (byte) (UCP_SESSION_CTRL | UCP_FLAG_HB);
+        pkt[2] = (byte) ((una >> 8) & 0xFF);
+        pkt[3] = (byte) (una & 0xFF);
+        int totalLen = pkt.length;
+        pkt[6] = (byte) ((totalLen >> 8) & 0xFF);
+        pkt[7] = (byte) (totalLen & 0xFF);
+        // Block ACK
+        int off = UCP_HDR_SIZE;
+        pkt[off] = (byte) BLOCK_ACK_MAGIC;
+        pkt[off + 1] = (byte) ((una >> 8) & 0xFF);
+        pkt[off + 2] = (byte) (una & 0xFF);
+        return pkt;
+    }
+
+    // ============================================================
     //  心跳线程（独立 socket）
     // ============================================================
     private void heartbeatLoop() {
+        while (running && !registered) {
+            try { Thread.sleep(50); } catch (InterruptedException e) { return; }
+        }
         try {
             sendSocket = new DatagramSocket();
             InetAddress addr = InetAddress.getByName(SERVER_IP);
+
+            // 先发文本注册
+            byte[] reg = "RKCAM:CONNECT".getBytes();
+            sendSocket.send(new DatagramPacket(reg, reg.length, addr, SERVER_PORT));
+
             while (running) {
                 try {
-                    byte[] data = "RKCAM:CONNECT".getBytes();
-                    sendSocket.send(new DatagramPacket(data, data.length, addr, SERVER_PORT));
+                    if (firstPacket) {
+                        byte[] data = "RKCAM:CONNECT".getBytes();
+                        sendSocket.send(new DatagramPacket(data, data.length, addr, SERVER_PORT));
+                    } else {
+                        byte[] hb = buildUcpHeartbeat(videoRcvNxt & 0xFFFF);
+                        sendSocket.send(new DatagramPacket(hb, hb.length, addr, SERVER_PORT));
+                    }
                 } catch (Exception e) { /* ignore */ }
                 try { Thread.sleep(1000); } catch (InterruptedException e) { break; }
             }
@@ -155,21 +210,45 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // ============================================================
-    //  主线程：收包 → 解析包头 → 按帧边界整帧喂解码器
+    //  H.265 IDR NALU 检测
+    // ============================================================
+    private boolean containsIDR(byte[] data, int length) {
+        for (int i = 0; i + 4 < length; i++) {
+            if (data[i] == 0 && data[i + 1] == 0) {
+                int scLen = 0;
+                if (i + 3 < length && data[i + 2] == 0 && data[i + 3] == 1) {
+                    scLen = 4;
+                } else if (data[i + 2] == 1) {
+                    scLen = 3;
+                }
+                if (scLen > 0 && i + scLen < length) {
+                    int nalType = (data[i + scLen] >> 1) & 0x3F;
+                    if (nalType == 19 || nalType == 20 || nalType == 21) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // ============================================================
+    //  主线程：收包 → UCP 解析 → SN 丢包检测 → 整帧喂解码器
     // ============================================================
     private void mainLoop() {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
         try {
             recvSocket = new DatagramSocket(LOCAL_PORT);
-            recvSocket.setReceiveBufferSize(4 * 1024 * 1024);  // 4MB，防突发丢包
+            recvSocket.setReceiveBufferSize(4 * 1024 * 1024);
             recvSocket.setSoTimeout(2000);
 
-            // 注册
+            // 用 recvSocket 发注册（确保端口 9000 先到达发送端）
             byte[] reg = "RKCAM:CONNECT".getBytes();
             InetAddress addr = InetAddress.getByName(SERVER_IP);
             recvSocket.send(new DatagramPacket(reg, reg.length, addr, SERVER_PORT));
+            registered = true;
 
-            updateStatus("已注册，等待 H.265 数据...");
+            updateStatus("已注册，等待 UCP H.265 数据...");
 
             byte[] buf = new byte[1500];
             DatagramPacket pkt = new DatagramPacket(buf, buf.length);
@@ -178,55 +257,64 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 try {
                     recvSocket.receive(pkt);
                     int len = pkt.getLength();
-                    if (len <= HDR_SIZE) continue;  // 包太小，跳过
+                    if (!isValidUcp(buf, len)) continue;
 
                     recvBytes += len;
                     recvPkts++;
 
-                    // 解析 2 字节包头
-                    int flags = buf[0] & 0xFF;
-                    int frameSeq = buf[1] & 0xFF;
-                    boolean moreData = (flags & FLAG_MORE) != 0;
-                    int frameType = flags & TYPE_MASK;
+                    int sn = parseSn(buf);
+                    boolean moreData = parseMoreData(buf);
+                    int dataOffset = UCP_HDR_SIZE;
+                    int dataLen = len - UCP_HDR_SIZE;
 
-                    int dataOffset = HDR_SIZE;
-                    int dataLen = len - HDR_SIZE;
-
-                    // 丢包检测：帧序号不连续 → 请求 IDR
-                    if (lastFrameSeq >= 0 && !moreData) {
-                        int expected = (lastFrameSeq + 1) & 0xFF;
-                        if (frameSeq != expected) {
-                            lostFrames++;
-                            sendCommand("RKCAM:IDR");
-                            // 丢弃当前不完整的帧
-                            frameLen = 0;
-                        }
+                    // ── SN 丢包检测 ──
+                    if (firstPacket) {
+                        videoRcvNxt = sn;
+                        firstPacket = false;
                     }
 
-                    // 追加数据到帧缓冲
+                    int snDiff = (sn - videoRcvNxt) & 0xFFFF;
+                    if (snDiff > 0x8000) {
+                        continue;  // 旧/重复包
+                    }
+                    if (snDiff > 0) {
+                        lostSnCount += snDiff;
+                        frameHasLoss = true;
+                    }
+                    videoRcvNxt = (sn + 1) & 0xFFFF;
+
+                    // ── 累积帧数据 ──
                     if (frameLen + dataLen < frameBuf.length) {
                         System.arraycopy(buf, dataOffset, frameBuf, frameLen, dataLen);
                         frameLen += dataLen;
                     }
 
-                    // moredata=0 → 一帧结束，处理整帧
+                    // ── moredata=0 → 帧结束 ──
                     if (!moreData) {
-                        if (frameType == TYPE_PARAM) {
-                            // VPS/SPS/PPS 参数集
-                            parseParamSets(frameBuf, frameLen);
-                        } else if (frameLen > 0) {
-                            // IDR 帧通常带 VPS+SPS+PPS，若解码器未初始化则从中提取
-                            if (!codecConfigured && frameType == TYPE_IDR) {
+                        if (frameLen > 0) {
+                            if (!codecConfigured) {
                                 parseParamSets(frameBuf, frameLen);
+                                // 在状态栏显示诊断信息
+                                final int fLen = frameLen;
+                                final int fSn = sn;
+                                final boolean hasVps = (vpsData != null);
+                                final boolean hasSps = (spsData != null);
+                                final boolean hasPps = (ppsData != null);
+                                final boolean cfg = codecConfigured;
+                                updateStatus("SN=" + fSn + " len=" + fLen +
+                                    "\nVPS=" + hasVps + " SPS=" + hasSps + " PPS=" + hasPps +
+                                    "\nconfigured=" + cfg);
                             }
-                            // 视频帧（IDR 或 P），整帧喂解码器
                             if (decoder != null && codecConfigured) {
                                 feedWholeFrame(frameBuf, frameLen);
                             }
                         }
+                        if (frameHasLoss) {
+                            lostFrames++;
+                        }
 
-                        lastFrameSeq = frameSeq;
                         frameLen = 0;
+                        frameHasLoss = false;
                     }
 
                 } catch (java.net.SocketTimeoutException e) {
@@ -242,7 +330,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     //  解析 VPS/SPS/PPS 参数集
     // ============================================================
     private void parseParamSets(byte[] data, int len) {
-        // 扫描 start code，提取各参数集
         int pos = 0;
         int lastStart = -1;
         int lastStartCodeLen = 0;
@@ -267,18 +354,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             pos++;
         }
-        // 最后一个
         if (lastStart >= 0) {
             saveParamNalu(data, lastStart, len - lastStart, lastStartCodeLen);
         }
 
-        // 尝试初始化解码器
         if (!codecConfigured) tryInitDecoder();
     }
 
     private void saveParamNalu(byte[] data, int offset, int length, int scLen) {
         if (length <= scLen) return;
-        // H.265 NALU type = (first_byte_after_startcode >> 1) & 0x3F
         int naluType = (data[offset + scLen] >> 1) & 0x3F;
 
         byte[] copy = new byte[length];
@@ -304,7 +388,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         try {
             MediaFormat format = MediaFormat.createVideoFormat("video/hevc", 800, 480);
 
-            // H.265 的 csd-0 = VPS + SPS + PPS 合并
             int csdLen = vpsData.length + spsData.length + ppsData.length;
             byte[] csd = new byte[csdLen];
             int off = 0;
@@ -314,7 +397,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             format.setByteBuffer("csd-0", ByteBuffer.wrap(csd));
 
             format.setInteger("low-latency", 1);
-            format.setInteger("priority", 0);  // 实时优先级
+            format.setInteger("priority", 0);
 
             decoder = MediaCodec.createDecoderByType("video/hevc");
             decoder.configure(format, surface, null, 0);
@@ -322,18 +405,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             codecConfigured = true;
             decodeErrorCount = 0;
 
-            updateStatus("H.265 解码器已初始化");
+            updateStatus("H.265 解码器已初始化 (UCP)");
         } catch (IOException e) {
             updateStatus("解码器初始化失败: " + e.getMessage());
         }
     }
 
     // ============================================================
-    //  整帧喂解码器（帧边界已由包头 moredata 精确确定）
+    //  整帧喂解码器
     // ============================================================
     private void feedWholeFrame(byte[] data, int length) {
         try {
-            int inIdx = decoder.dequeueInputBuffer(18000);  // 18ms（与输出线程一致，参考 mondo）
+            int inIdx = decoder.dequeueInputBuffer(18000);
             if (inIdx < 0) return;
 
             ByteBuffer inBuf = decoder.getInputBuffer(inIdx);
@@ -367,7 +450,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
 
             try {
-                int outIdx = decoder.dequeueOutputBuffer(info, 18000);  // 18ms（参考 mondo）
+                int outIdx = decoder.dequeueOutputBuffer(info, 18000);
                 if (outIdx >= 0) {
                     decoder.releaseOutputBuffer(outIdx, true);
                     decodedFrames++;
@@ -399,11 +482,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             float fps = decodedFrames / dt;
 
             String status = String.format(Locale.US,
-                "RockitCam H.265 Viewer\n" +
+                "RockitCam UCP H.265 Viewer\n" +
                 "码率: %.0f kbps | 帧率: %.1f fps\n" +
-                "收包: %d | 丢帧: %d\n" +
+                "收包: %d | SN丢失: %d | 丢帧: %d\n" +
                 "状态: %s",
-                kbps, fps, recvPkts, lostFrames,
+                kbps, fps, recvPkts, lostSnCount, lostFrames,
                 codecConfigured ? "解码中" : "等待 VPS/SPS/PPS...");
 
             runOnUiThread(() -> statusText.setText(status));
