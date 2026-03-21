@@ -292,10 +292,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     // ── moredata=0 → 帧结束 ──
                     if (!moreData) {
                         if (frameLen > 0) {
-                            // 无论是否丢包，都喂给解码器
-                            // 参考 UCP 协议：视频不重传，丢了照样播，解码器自己容错
                             if (!codecConfigured) {
                                 parseParamSets(frameBuf, frameLen);
+                                // 在状态栏显示诊断信息
+                                final int fLen = frameLen;
+                                final int fSn = sn;
+                                final boolean hasVps = (vpsData != null);
+                                final boolean hasSps = (spsData != null);
+                                final boolean hasPps = (ppsData != null);
+                                final boolean cfg = codecConfigured;
+                                updateStatus("SN=" + fSn + " len=" + fLen +
+                                    "\nVPS=" + hasVps + " SPS=" + hasSps + " PPS=" + hasPps +
+                                    "\nconfigured=" + cfg);
                             }
                             if (decoder != null && codecConfigured) {
                                 feedWholeFrame(frameBuf, frameLen);
