@@ -17,16 +17,15 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Locale;
+import java.util.concurrent.ArrayBlockingQueue;
 
 /**
  * RockitCam H.264 UDP 图传接收端
  *
- * 数据流：
- *   UDP 收包 → 拼接 NALU → 解析 SPS/PPS/IDR/P → MediaCodec 硬解 → SurfaceView 显示
- *
- * 协议：
- *   发 "RKCAM:CONNECT" 到泰山派 UDP 8080 注册
- *   泰山派回发裸 H.264 NALU 数据
+ * 架构：3 线程分离
+ *   线程1 UdpRecv：    纯收包，零处理，速度最快
+ *   线程2 NaluParser：  从收包队列取数据，拼接+解析 NALU，喂给 MediaCodec 输入
+ *   线程3 DecodeOut：   持续排空 MediaCodec 输出，渲染到 Surface（带 vsync）
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -46,18 +45,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private Handler uiHandler;
 
     // ── 统计 ──
-    private long recvBytes = 0;
-    private int recvPkts = 0;
-    private int decodedFrames = 0;
+    private volatile long recvBytes = 0;
+    private volatile int recvPkts = 0;
+    private volatile int decodedFrames = 0;
+    private volatile int droppedPkts = 0;
     private long lastStatTime = 0;
 
+    // ── 收包 → 解析 的无锁队列 ──
+    // 预分配 byte[] 池，避免 GC
+    private static final int QUEUE_SIZE = 512;
+    private static final int PKT_BUF_SIZE = 1500;
+    private final ArrayBlockingQueue<byte[]> freePool = new ArrayBlockingQueue<>(QUEUE_SIZE);
+    private final ArrayBlockingQueue<PacketData> recvQueue = new ArrayBlockingQueue<>(QUEUE_SIZE);
+
+    private static class PacketData {
+        byte[] data;
+        int length;
+    }
+
     // ── NALU 拼接缓冲 ──
-    // 泰山派按 MTU 分片发送，一帧可能跨多个 UDP 包
-    // 我们收到数据直接拼接，然后按 start code 分割喂给 MediaCodec
-    private byte[] naluBuffer = new byte[512 * 1024];  // 512KB 够大
+    private byte[] naluBuffer = new byte[1024 * 1024];  // 1MB
     private int naluLen = 0;
 
-    private boolean codecConfigured = false;
+    private volatile boolean codecConfigured = false;
+    private byte[] spsData;
+    private byte[] ppsData;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -70,6 +82,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         SurfaceView sv = findViewById(R.id.surfaceView);
         sv.getHolder().addCallback(this);
 
+        // 预分配 buffer 池
+        for (int i = 0; i < QUEUE_SIZE; i++) {
+            freePool.offer(new byte[PKT_BUF_SIZE]);
+        }
+
         updateStatus("等待 Surface 就绪...");
     }
 
@@ -78,13 +95,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         surface = holder.getSurface();
         running = true;
 
-        // 启动网络收包线程
-        new Thread(this::networkLoop, "UdpRecv").start();
+        // 线程1：纯收包
+        new Thread(this::udpRecvLoop, "UdpRecv").start();
 
-        // 启动心跳线程
+        // 线程2：NALU 解析 + 喂解码器输入
+        new Thread(this::naluParseLoop, "NaluParser").start();
+
+        // 线程3：解码器输出 + 渲染
+        new Thread(this::decodeOutputLoop, "DecodeOut").start();
+
+        // 心跳
         new Thread(this::heartbeatLoop, "Heartbeat").start();
 
-        // 启动统计刷新
+        // 统计
         uiHandler.postDelayed(this::updateStats, 1000);
 
         updateStatus("已启动，等待数据...");
@@ -97,6 +120,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     public void surfaceDestroyed(SurfaceHolder holder) {
         running = false;
         sendCommand("RKCAM:LEAVE");
+        // 等线程退出
+        try { Thread.sleep(200); } catch (InterruptedException ignored) {}
         releaseDecoder();
         if (socket != null && !socket.isClosed()) {
             socket.close();
@@ -132,20 +157,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // ============================================================
-    //  网络收包线程
+    //  线程1：纯 UDP 收包，不做任何处理
     // ============================================================
-    private void networkLoop() {
+    private void udpRecvLoop() {
         try {
             socket = new DatagramSocket(LOCAL_PORT);
             socket.setSoTimeout(2000);
-            socket.setReceiveBufferSize(512 * 1024);
+            socket.setReceiveBufferSize(1024 * 1024);  // 1MB 接收缓冲
 
-            // 发送注册
             sendCommand("RKCAM:CONNECT");
             updateStatus("已注册，等待 H.264 数据...");
 
-            byte[] buf = new byte[2048];  // 单个 UDP 包最大 ~1460 字节
-            DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+            byte[] directBuf = new byte[PKT_BUF_SIZE];
+            DatagramPacket pkt = new DatagramPacket(directBuf, directBuf.length);
 
             while (running) {
                 try {
@@ -156,17 +180,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     recvBytes += len;
                     recvPkts++;
 
-                    // 把收到的数据追加到 NALU 缓冲
-                    if (naluLen + len < naluBuffer.length) {
-                        System.arraycopy(buf, 0, naluBuffer, naluLen, len);
-                        naluLen += len;
+                    // 从池中取 buffer，拷贝数据，放入队列
+                    byte[] buf = freePool.poll();
+                    if (buf == null) {
+                        // 池空了 = 解析线程跟不上，丢包
+                        droppedPkts++;
+                        continue;
                     }
+                    System.arraycopy(directBuf, 0, buf, 0, len);
 
-                    // 尝试从缓冲中提取完整 NALU 喂给解码器
-                    processNaluBuffer();
+                    PacketData pd = new PacketData();
+                    pd.data = buf;
+                    pd.length = len;
 
+                    if (!recvQueue.offer(pd)) {
+                        // 队列满，归还 buffer 并丢弃
+                        freePool.offer(buf);
+                        droppedPkts++;
+                    }
                 } catch (java.net.SocketTimeoutException e) {
-                    // 超时正常，继续
+                    // 正常
                 }
             }
         } catch (Exception e) {
@@ -175,24 +208,44 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // ============================================================
-    //  NALU 解析与解码
+    //  线程2：从队列取包 → 拼接 → 解析 NALU → 喂 MediaCodec 输入
     // ============================================================
+    private void naluParseLoop() {
+        while (running) {
+            try {
+                PacketData pd = recvQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+                if (pd == null) continue;
+
+                // 追加到 NALU 缓冲
+                if (naluLen + pd.length < naluBuffer.length) {
+                    System.arraycopy(pd.data, 0, naluBuffer, naluLen, pd.length);
+                    naluLen += pd.length;
+                }
+
+                // 归还 buffer 到池
+                freePool.offer(pd.data);
+
+                // 提取完整 NALU
+                processNaluBuffer();
+
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+    }
 
     /**
-     * 从缓冲区中找到 start code (00 00 00 01) 分割 NALU，逐个喂给 MediaCodec
+     * 从缓冲区中找 start code (00 00 00 01) 分割 NALU
      */
     private void processNaluBuffer() {
-        // 找所有 start code 位置
         int pos = 0;
         int lastStart = -1;
 
         while (pos + 3 < naluLen) {
-            // 检查 4 字节 start code: 00 00 00 01
             if (naluBuffer[pos] == 0 && naluBuffer[pos + 1] == 0 &&
                 naluBuffer[pos + 2] == 0 && naluBuffer[pos + 3] == 1) {
 
                 if (lastStart >= 0) {
-                    // 从 lastStart 到 pos 是一个完整 NALU
                     feedNalu(naluBuffer, lastStart, pos - lastStart);
                 }
                 lastStart = pos;
@@ -207,31 +260,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             int remaining = naluLen - lastStart;
             System.arraycopy(naluBuffer, lastStart, naluBuffer, 0, remaining);
             naluLen = remaining;
-        } else if (naluLen > 256 * 1024) {
-            // 缓冲太大但没找到 start code，清空防止溢出
+        } else if (naluLen > 512 * 1024) {
             naluLen = 0;
         }
     }
 
     /**
-     * 把一个完整 NALU（含 start code）喂给 MediaCodec
+     * 把一个完整 NALU 喂给 MediaCodec
      */
     private void feedNalu(byte[] data, int offset, int length) {
-        if (length < 5) return;  // start code(4) + nalu_type(1) 最少 5 字节
+        if (length < 5) return;
 
         int naluType = data[offset + 4] & 0x1F;
 
-        // SPS (7) — 配置解码器
+        // SPS (7)
         if (naluType == 7) {
             if (!codecConfigured) {
-                // 暂存 SPS，等 PPS 一起配置
                 spsData = new byte[length];
                 System.arraycopy(data, offset, spsData, 0, length);
             }
             return;
         }
 
-        // PPS (8) — 用 SPS + PPS 初始化 MediaCodec
+        // PPS (8)
         if (naluType == 8) {
             if (!codecConfigured && spsData != null) {
                 ppsData = new byte[length];
@@ -241,44 +292,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
 
-        // IDR (5) 或 P 帧 (1) — 送解码
+        // IDR (5) 或 P 帧 (1)
         if (decoder != null && codecConfigured) {
-            decodeFrame(data, offset, length, naluType == 5);
+            feedToDecoder(data, offset, length, naluType == 5);
         }
     }
 
-    private byte[] spsData;
-    private byte[] ppsData;
-
-    /**
-     * 用 SPS/PPS 初始化 MediaCodec H.264 解码器
-     */
     private void initDecoder(byte[] sps, byte[] pps) {
         try {
-            // 从 SPS 解析宽高（简单方式：用默认值，MediaCodec 会自动检测）
             MediaFormat format = MediaFormat.createVideoFormat("video/avc", 800, 480);
             format.setByteBuffer("csd-0", ByteBuffer.wrap(sps));
             format.setByteBuffer("csd-1", ByteBuffer.wrap(pps));
+            // 低延迟提示
+            format.setInteger("low-latency", 1);
 
             decoder = MediaCodec.createDecoderByType("video/avc");
             decoder.configure(format, surface, null, 0);
             decoder.start();
             codecConfigured = true;
 
-            updateStatus("解码器已初始化 (800x480)");
+            updateStatus("解码器已初始化");
         } catch (IOException e) {
             updateStatus("解码器初始化失败: " + e.getMessage());
         }
     }
 
     /**
-     * 送一帧给 MediaCodec 解码
+     * 只负责往 MediaCodec 输入端送数据，不取输出（输出由线程3处理）
      */
-    private void decodeFrame(byte[] data, int offset, int length, boolean isIDR) {
+    private void feedToDecoder(byte[] data, int offset, int length, boolean isIDR) {
         try {
-            // 获取输入缓冲
-            int inIdx = decoder.dequeueInputBuffer(10000);  // 10ms 超时
-            if (inIdx < 0) return;
+            int inIdx = decoder.dequeueInputBuffer(5000);  // 5ms 超时
+            if (inIdx < 0) return;  // 输入满了就跳过，不阻塞收包
 
             ByteBuffer inBuf = decoder.getInputBuffer(inIdx);
             if (inBuf == null) return;
@@ -288,29 +333,45 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
             int flags = isIDR ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
             decoder.queueInputBuffer(inIdx, 0, length, System.nanoTime() / 1000, flags);
-
-            // 取出解码结果并渲染
-            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-            int outIdx = decoder.dequeueOutputBuffer(info, 0);
-            while (outIdx >= 0) {
-                decoder.releaseOutputBuffer(outIdx, true);  // true = 渲染到 Surface
-                decodedFrames++;
-                outIdx = decoder.dequeueOutputBuffer(info, 0);
-            }
         } catch (Exception e) {
-            // 解码错误，请求 IDR
             sendCommand("RKCAM:IDR");
         }
     }
 
+    // ============================================================
+    //  线程3：持续排空 MediaCodec 输出，渲染到 Surface
+    // ============================================================
+    private void decodeOutputLoop() {
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+
+        while (running) {
+            if (decoder == null || !codecConfigured) {
+                try { Thread.sleep(10); } catch (InterruptedException e) { break; }
+                continue;
+            }
+
+            try {
+                int outIdx = decoder.dequeueOutputBuffer(info, 10000);  // 10ms 等待
+                if (outIdx >= 0) {
+                    // 用时间戳渲染，利用 vsync 防撕裂
+                    decoder.releaseOutputBuffer(outIdx, info.presentationTimeUs * 1000);
+                    decodedFrames++;
+                }
+            } catch (Exception e) {
+                // 解码器可能被释放了
+                try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+            }
+        }
+    }
+
     private void releaseDecoder() {
+        codecConfigured = false;
         if (decoder != null) {
             try {
                 decoder.stop();
                 decoder.release();
             } catch (Exception e) { /* ignore */ }
             decoder = null;
-            codecConfigured = false;
         }
     }
 
@@ -328,11 +389,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
             String status = String.format(Locale.US,
                 "RockitCam Viewer\n" +
-                "码率: %.0f kbps\n" +
-                "帧率: %.0f fps\n" +
-                "收包: %d\n" +
+                "码率: %.0f kbps | 帧率: %.1f fps\n" +
+                "收包: %d | 丢弃: %d\n" +
                 "状态: %s",
-                kbps, fps, recvPkts,
+                kbps, fps, recvPkts, droppedPkts,
                 codecConfigured ? "解码中" : "等待 SPS/PPS...");
 
             runOnUiThread(() -> statusText.setText(status));
