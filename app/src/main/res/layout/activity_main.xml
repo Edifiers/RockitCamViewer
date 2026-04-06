@@ -4,21 +4,30 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
+    <!-- 视频画面：保持原始比例，居中显示 -->
     <SurfaceView
         android:id="@+id/surfaceView"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
 
-    <TextView
-        android:id="@+id/statusText"
-        android:layout_width="wrap_content"
+    <!-- 调试信息面板 -->
+    <ScrollView
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|left"
-        android:padding="12dp"
-        android:text="连接中..."
-        android:textColor="#00FF00"
-        android:textSize="14sp"
-        android:fontFamily="monospace"
-        android:background="#80000000" />
+        android:layout_gravity="top"
+        android:background="#CC000000"
+        android:padding="8dp">
+        
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="连接中..."
+            android:textColor="#00FF00"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:lineSpacingExtra="2dp" />
+    </ScrollView>
 
 </FrameLayout>

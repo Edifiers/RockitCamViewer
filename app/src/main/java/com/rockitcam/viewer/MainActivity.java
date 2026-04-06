@@ -19,7 +19,7 @@ import java.nio.ByteBuffer;
 import java.util.Locale;
 
 /**
- * RockitCam UCP H.265 图传接收端
+ * RockitCam UCP H.265 图传接收端（802.11n 2.4GHz 优化版）
  *
  * UCP 协议：每个 UDP 包前 12 字节包头
  *   [0]     ver_magic = 0x15
@@ -30,6 +30,8 @@ import java.util.Locale;
  *   [8-11]  timestamp (uint32, 网络序)
  *
  * 通过 SN 间隙精确检测丢包，丢包后等完整无损 IDR 恢复
+ * 
+ * 编码器：H.265 (低码率高画质，适合 2.4GHz 远距离传输)
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -49,6 +51,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final int NAL_VPS = 32;
     private static final int NAL_SPS = 33;
     private static final int NAL_PPS = 34;
+    private static final int NAL_IDR = 19;  // 或 20, 21
 
     private volatile boolean running = false;
     private DatagramSocket recvSocket;
@@ -65,6 +68,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile int lostFrames = 0;
     private volatile int lostSnCount = 0;
     private long lastStatTime = 0;
+    
+    // 新增：详细统计数据
+    private volatile int idrFrameCount = 0;
+    private volatile int pFrameCount = 0;
+    private volatile long totalFrameBytes = 0;
+    private volatile int decodeErrors = 0;
+    private volatile long minFrameSize = Long.MAX_VALUE;
+    private volatile long maxFrameSize = 0;
+    private volatile long lastFrameTime = 0;
+    private volatile int currentFps = 0;
 
     // 帧组装
     private byte[] frameBuf = new byte[1024 * 1024];
@@ -75,7 +88,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private boolean firstPacket = true;
     private boolean frameHasLoss = false;
 
-    // 参数集缓存
+    // 参数集缓存（H.265 需要 VPS/SPS/PPS）
     private volatile boolean codecConfigured = false;
     private byte[] vpsData;
     private byte[] spsData;
@@ -108,11 +121,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         new Thread(this::heartbeatLoop, "Heartbeat").start();
 
         uiHandler.postDelayed(this::updateStats, 1000);
-        updateStatus("[V4] 已启动，等待数据...");
+        updateStatus("[802.11n 2.4GHz] 已启动，等待数据...");
     }
 
     @Override
-    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {}
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        // 设置 SurfaceView 保持原始视频比例（800x480 = 5:3）
+        adjustSurfaceViewAspectRatio(width, height);
+    }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
@@ -132,6 +148,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void closeSocket(DatagramSocket s) {
         if (s != null && !s.isClosed()) s.close();
+    }
+
+    // ============================================================
+    //  调整 SurfaceView 比例（保持 800x480 = 5:3）
+    // ============================================================
+    private void adjustSurfaceViewAspectRatio(int surfaceWidth, int surfaceHeight) {
+        SurfaceView sv = findViewById(R.id.surfaceView);
+        if (sv == null) return;
+
+        // 视频原始比例 800:480 = 5:3
+        float videoAspect = 800f / 480f;
+        float surfaceAspect = (float) surfaceWidth / surfaceHeight;
+
+        int newWidth, newHeight;
+        if (surfaceAspect > videoAspect) {
+            // 屏幕更宽，以高度为准
+            newHeight = surfaceHeight;
+            newWidth = (int) (surfaceHeight * videoAspect);
+        } else {
+            // 屏幕更高，以宽度为准
+            newWidth = surfaceWidth;
+            newHeight = (int) (surfaceWidth / videoAspect);
+        }
+
+        android.view.ViewGroup.LayoutParams params = sv.getLayoutParams();
+        params.width = newWidth;
+        params.height = newHeight;
+        sv.setLayoutParams(params);
     }
 
     // ============================================================
@@ -222,8 +266,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     scLen = 3;
                 }
                 if (scLen > 0 && i + scLen < length) {
-                    int nalType = (data[i + scLen] >> 1) & 0x3F;
-                    if (nalType == 19 || nalType == 20 || nalType == 21) {
+                    int nalType = (data[i + scLen] >> 1) & 0x3F;  // H.265 NALU type
+                    if (nalType == 19 || nalType == 20 || nalType == 21) {  // IDR
                         return true;
                     }
                 }
@@ -292,6 +336,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     // ── moredata=0 → 帧结束 ──
                     if (!moreData) {
                         if (frameLen > 0) {
+                            // 统计帧大小
+                            if (frameLen < minFrameSize) minFrameSize = frameLen;
+                            if (frameLen > maxFrameSize) maxFrameSize = frameLen;
+                            totalFrameBytes += frameLen;
+                            
+                            // 检测帧类型
+                            boolean isIDR = containsIDR(frameBuf, frameLen);
+                            if (isIDR) idrFrameCount++;
+                            else pFrameCount++;
+                            
                             if (!codecConfigured) {
                                 parseParamSets(frameBuf, frameLen);
                                 // 在状态栏显示诊断信息
@@ -363,7 +417,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void saveParamNalu(byte[] data, int offset, int length, int scLen) {
         if (length <= scLen) return;
-        int naluType = (data[offset + scLen] >> 1) & 0x3F;
+        int naluType = (data[offset + scLen] >> 1) & 0x3F;  // H.265 NALU type (6位)
 
         byte[] copy = new byte[length];
         System.arraycopy(data, offset, copy, 0, length);
@@ -388,6 +442,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         try {
             MediaFormat format = MediaFormat.createVideoFormat("video/hevc", 800, 480);
 
+            // H.265 参数集：VPS + SPS + PPS
             int csdLen = vpsData.length + spsData.length + ppsData.length;
             byte[] csd = new byte[csdLen];
             int off = 0;
@@ -405,7 +460,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             codecConfigured = true;
             decodeErrorCount = 0;
 
-            updateStatus("H.265 解码器已初始化 (UCP)");
+            updateStatus("H.265 解码器已初始化 (802.11n 2.4GHz)");
         } catch (IOException e) {
             updateStatus("解码器初始化失败: " + e.getMessage());
         }
@@ -427,8 +482,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
             decoder.queueInputBuffer(inIdx, 0, length, System.nanoTime() / 1000, 0);
             decodeErrorCount = 0;
+            
+            // 记录帧时间（用于计算实时帧率）
+            long now = System.currentTimeMillis();
+            if (lastFrameTime > 0) {
+                long interval = now - lastFrameTime;
+                if (interval > 0) {
+                    currentFps = (int) (1000 / interval);
+                }
+            }
+            lastFrameTime = now;
+            
         } catch (Exception e) {
             decodeErrorCount++;
+            decodeErrors++;
             if (decodeErrorCount > 30 && vpsData != null && spsData != null && ppsData != null) {
                 codecConfigured = false;
                 sendCommand("RKCAM:IDR");
@@ -470,7 +537,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // ============================================================
-    //  UI 统计
+    //  UI 统计（详细调试信息）
     // ============================================================
     private void updateStats() {
         if (!running) return;
@@ -480,19 +547,54 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             float dt = (now - lastStatTime) / 1000f;
             float kbps = recvBytes * 8 / dt / 1000;
             float fps = decodedFrames / dt;
+            
+            // 计算平均帧大小
+            long avgFrameSize = (idrFrameCount + pFrameCount > 0) ? 
+                totalFrameBytes / (idrFrameCount + pFrameCount) : 0;
+            
+            // 计算丢包率
+            float lossRate = (recvPkts > 0) ? 
+                (lostSnCount * 100f / (recvPkts + lostSnCount)) : 0;
 
             String status = String.format(Locale.US,
-                "[V4] RockitCam UCP H.265\n" +
-                "码率: %.0f kbps | 帧率: %.1f fps\n" +
-                "收包: %d | SN丢失: %d | 丢帧: %d\n" +
-                "状态: %s",
-                kbps, fps, recvPkts, lostSnCount, lostFrames,
-                codecConfigured ? "解码中" : "等待 VPS/SPS/PPS...");
+                "╔═══ RockitCam H.265 (802.11n 2.4GHz) ═══╗\n" +
+                "║ 网络统计\n" +
+                "║  码率: %.1f kbps | 收包: %d\n" +
+                "║  丢包: %d (%.1f%%) | 丢帧: %d\n" +
+                "║\n" +
+                "║ 视频统计\n" +
+                "║  解码帧率: %.1f fps | 实时帧率: %d fps\n" +
+                "║  IDR帧: %d | P帧: %d\n" +
+                "║  帧大小: 平均 %d KB\n" +
+                "║  帧大小: 最小 %d KB | 最大 %d KB\n" +
+                "║\n" +
+                "║ 解码器状态\n" +
+                "║  状态: %s\n" +
+                "║  解码错误: %d\n" +
+                "╚═══════════════════════════════════════╝",
+                kbps, recvPkts,
+                lostSnCount, lossRate, lostFrames,
+                fps, currentFps,
+                idrFrameCount, pFrameCount,
+                avgFrameSize / 1024,
+                minFrameSize == Long.MAX_VALUE ? 0 : minFrameSize / 1024,
+                maxFrameSize / 1024,
+                codecConfigured ? "✓ 解码中" : "✗ 等待 VPS/SPS/PPS",
+                decodeErrors);
 
             runOnUiThread(() -> statusText.setText(status));
 
+            // 重置统计
             recvBytes = 0;
             decodedFrames = 0;
+            recvPkts = 0;
+            lostSnCount = 0;
+            lostFrames = 0;
+            idrFrameCount = 0;
+            pFrameCount = 0;
+            totalFrameBytes = 0;
+            minFrameSize = Long.MAX_VALUE;
+            maxFrameSize = 0;
         }
         lastStatTime = now;
 
